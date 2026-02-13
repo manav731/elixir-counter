@@ -2,6 +2,10 @@
 This project is for educational purposes only.
 All game assets belong to Supercell.
 
+## Youtube
+Check out my youtubr video for full walkthrough:
+https://youtu.be/bKbxBAIL_XY?si=hTeu8PayRhfHZTyp
+
 ## Elixer_Tracker
 Elixer_Tracker is a real-time computer vision system that detects enemy card deployments and estimates enemy elixir using motion detection and deep learning.
 
