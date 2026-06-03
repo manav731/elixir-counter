@@ -22,7 +22,6 @@ This project is not affiliated with, endorsed by, or sponsored by Supercell.
 * Motion-based troop deployment detection
 * MobileNetV2 image classification
 * Enemy elixir estimation
-* Mirror card logic support
 * Real-time prediction overlay
 
 ---
@@ -170,7 +169,7 @@ These values are different for every computer.
 
 ---
 
-## Step 3 - Run ArenaSense
+## Step 3 - Run Elixer counter
 
 After training and configuring screen coordinates:
 
