@@ -83,7 +83,9 @@ pip install -r requirements.txt
 
 ## Important Path Configuration
 
-Some files contain paths configured for my local machine.
+Paths are now relative to the repo. Override with the `ELIXIR_DATA` / `ELIXIR_MODEL` environment variables.
+
+(Legacy note, no longer needed:)
 
 Example:
 
@@ -138,52 +140,35 @@ Training time depends on your hardware.
 
 ---
 
-## Step 2 - Configure Screen Region
-
-Run:
+## Step 2 - Find Your Screen Region
 
 ```bash
 python src/get_region.py
 ```
 
-Select your Clash Royale game window and note the coordinates.
-
-Update the coordinates inside:
-
-```text
-src/motion_detect_demo.py
-```
-
-Example:
-
-```python
-monitor = {
-    "top": 56,
-    "left": 1051,
-    "width": 919,
-    "height": 1318
-}
-```
-
-These values are different for every computer.
+It prints a ready-to-paste `--region TOP,LEFT,WIDTH,HEIGHT` argument. No file editing needed.
 
 ---
 
-## Step 3 - Run Elixer counter
+## Step 3 - Run the Elixir Counter
 
-After training and configuring screen coordinates:
+Live (start it as the battle begins, press `s` at the "Fight" moment to sync the clock):
 
 ```bash
-python src/motion_detect_demo.py
+python src/motion_detect_demo.py --region 56,1051,919,1318
 ```
 
-The system will:
+Or on a recorded clip (deterministic, ideal for demos):
 
-1. Capture the game window
-2. Detect troop deployments
-3. Classify detected cards
-4. Apply elixir logic
-5. Estimate enemy elixir in real time
+```bash
+python src/motion_detect_demo.py --video gameplay.mp4 --start-at 3.0
+```
+
+Hotkeys: `s` re-sync battle start, `+` / `-` nudge elixir when it drifts, `q` quit.
+Tune `--roi 0.12,0.42` so the yellow "enemy zone" box covers the opponent's half of the arena
+(down to the river). Only motion inside it is treated as an enemy deployment.
+
+Sanity checks: `python -m pytest tests` and `python src/check_costs.py` (run the latter after retraining).
 
 ---
 
@@ -228,11 +213,14 @@ elixir-counter
 │
 ├── src
 │   ├── card_classifier.py
+│   ├── elixir_tracker.py   # elixir/cost/mirror logic (unit-tested)
+│   ├── check_costs.py
 │   ├── get_region.py
 │   ├── motion_detect_demo.py
 │   └── train_card_classifier.py
 │
 ├── requirements.txt
+├── tests/
 ├── LICENSE.txt
 └── README.md
 ```
@@ -264,3 +252,25 @@ If you use this project, please consider giving the repository a star.
 ## License
 
 Released under the MIT License.
+
+
+---
+
+## Fixing wrong card predictions (train on your own screen)
+
+The shipped model was trained on card icons. For reliable results, fine-tune it on crops from your setup:
+
+```bash
+# 1. Collect crops while you play / watch a battle (or on a recorded clip with --video)
+python src/motion_detect_demo.py --region T,L,W,H --save-crops crops --no-mirror
+
+# 2. Label them. Use the OPPONENT'S deck from that battle (shown in the in-game battle log)
+python src/label_crops.py --crops crops --deck "hog rider,musketeer,fireball,ice spirit,skeletons,cannon,ice golem,log"
+#    keys: 1-8 = card, 0 = background/not a deployment, space = skip, u = undo, q = quit
+
+# 3. Repeat 1-2 for several battles (aim for 30+ crops per card, 100+ background), then train
+python src/finetune_arena.py --data data/arena --out models/card_classifier_arena.pth
+
+# 4. Run with the new model and the opponent's deck
+python src/motion_detect_demo.py --region T,L,W,H --model models/card_classifier_arena.pth --deck "..."
+```

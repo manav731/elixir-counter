@@ -1,268 +1,229 @@
-import mss
-import cv2
-import numpy as np
-import sys
+"""
+Real-time enemy elixir tracker for Clash Royale.
+
+Live screen capture:
+    python src/motion_detect_demo.py --region TOP,LEFT,WIDTH,HEIGHT
+Recorded gameplay clip (deterministic - best for testing / making the demo):
+    python src/motion_detect_demo.py --video gameplay.mp4 --start-at 3.0 --deck "card1,...,card8"
+
+Hotkeys (window focused):  s = match just started (re-sync clock, elixir=5)
+                           + / - = nudge elixir by 1 when the estimate drifts
+                           q = quit
+"""
+import argparse
 import os
+import sys
 import time
 from collections import deque
 
-# Allow imports from src
-sys.path.append(os.path.dirname(__file__))
+import cv2
+import numpy as np
 
-from card_classifier import predict_card
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from elixir_tracker import CardVoter, ElixirTracker, lookup_cost  # noqa: E402
 
 # ---------------- CONFIG ----------------
 CONF_THRESHOLD = 0.6
-MIN_CONTOUR_AREA = 1500
-DEBOUNCE_FRAMES = 4
-DETECTION_COOLDOWN = 1.5     # seconds between card detections
-ELIXIR_PRINT_INTERVAL = 2.0 # print elixir every 2 seconds
+REF_WIDTH = 919               # width MIN_CONTOUR_AREA / PAD were tuned for
+MIN_CONTOUR_AREA = 1500       # scaled by (width / REF_WIDTH)^2
+MAX_CONTOUR_FRACTION = 0.35   # ignore "whole ROI changed" frames (flashes, transitions)
+PAD = 20
+ELIXIR_MARGIN = 1.0           # tolerance for estimate drift in the 'can they afford it' rule
+POST_PLAY_COOLDOWN = 0.8      # s between two confirmed plays
+DEFAULT_REGION = "56,1051,919,1318"   # top,left,width,height (your original values)
+DEFAULT_ROI = "0.12,0.42"     # vertical band (fraction of frame height) = ENEMY half of arena
+WINDOW = "Arena Elixir Tracker"
+# ----------------------------------------
 
-# Elixir rules
-START_ELIXIR = 5
-MAX_ELIXIR = 10
 
-# Arena region
-monitor = {
-    "top": 56,
-    "left": 1051,
-    "width": 919,
-    "height": 1318
-}
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video", help="analyse a recorded clip instead of the live screen")
+    ap.add_argument("--region", default=DEFAULT_REGION, help="live capture: top,left,width,height")
+    ap.add_argument("--roi", default=DEFAULT_ROI,
+                    help="y0,y1 fractions of the frame covering the enemy's side of the arena")
+    ap.add_argument("--start-at", type=float, default=0.0,
+                    help="video: second at which the battle starts (match clock = 0)")
+    ap.add_argument("--fps", type=float, default=20.0, help="live capture frame rate")
+    ap.add_argument("--conf", type=float, default=CONF_THRESHOLD)
+    ap.add_argument("--no-mirror", action="store_true", help="disable Mirror (+1) inference")
+    ap.add_argument("--model", help="path to a .pth (e.g. models/card_classifier_arena.pth)")
+    ap.add_argument("--deck", help="comma-separated opponent deck (up to 8 cards); restricts predictions to it")
+    ap.add_argument("--save-crops", metavar="DIR", help="save every motion crop to DIR for labelling/fine-tuning")
+    ap.add_argument("--headless", action="store_true", help="no window (print events to the terminal only)")
+    return ap.parse_args()
 
-# ---------- RAW (HUMAN) ELIXIR COST TABLE ----------
-ELIXIR_COST_RAW = {
-    "Archers": 3,
-    "Arrows": 3,
-    "Knight": 3,
-    "Minions": 3,
-    "Fireball": 4,
-    "Mini P.E.K.K.A": 4,
-    "Musketeer": 4,
-    "Giant": 5,
-    "Spear Goblins": 2,
-    "Goblins": 2,
-    "Goblin Cage": 4,
-    "Goblin Hut": 5,
-    "Skeletons": 1,
-    "Bomber": 2,
-    "Tombstone": 3,
-    "Valkyrie": 4,
-    "Cannon": 3,
-    "Barbarians": 5,
-    "Mega Minion": 3,
-    "Battle Ram": 4,
-    "Electro Spirit": 1,
-    "Skeleton Dragons": 4,
-    "Fire Spirit": 1,
-    "Bomb Tower": 4,
-    "Inferno Tower": 5,
-    "Bats": 2,
-    "Mortar": 4,
-    "Flying Machine": 4,
-    "Rocket": 6,
-    "Goblin Barrel": 3,
-    "Guards": 3,
-    "Skeleton Army": 3,
-    "Baby Dragon": 4,
-    "Witch": 5,
-    "P.E.K.K.A": 7,
-    "Royal Giant": 6,
-    "Royal Recruits": 7,
-    "Royal Hogs": 5,
-    "Dark Prince": 4,
-    "Prince": 5,
-    "Balloon": 5,
-    "Three Musketeers": 9,
-    "Ice Spirit": 1,
-    "Giant Snowball": 2,
-    "Ice Golem": 2,
-    "Battle Healer": 4,
-    "Giant Skeleton": 6,
-    "Goblin Gang": 3,
-    "Skeleton Barrel": 3,
-    "Dart Goblin": 3,
-    "Barbarian Hut": 7,
-    "Goblin Giant": 6,
-    "Tesla": 4,
-    "Elite Barbarians": 6,
-    "Furnace": 4,
-    "Zappies": 4,
-    "Hunter": 4,
-    "X-Bow": 6,
-    "Golem": 8,
-    "Princess": 3,
-    "Electro Wizard": 4,
-    "Inferno Dragon": 4,
-    "Ram Rider": 5,
-    "Firecracker": 3,
-    "Wall Breakers": 2,
-    "Electro Dragon": 5,
-    "Ice Wizard": 3,
-    "Royal Ghost": 3,
-    "Phoenix": 4,
-    "Rascals": 5,
-    "Heal Spirit": 1,
-    "Bowler": 5,
-    "Bandit": 3,
-    "Magic Archer": 4,
-    "Lava Hound": 7,
-    "Elixir Golem": 3,
-    "Executioner": 5,
-    "Lumberjack": 4,
-    "Night Witch": 4,
-    "Elixir Collector": 6,
-    "Cannon Cart": 5,
-    "Fisherman": 3,
-    "Golden Knight": 4,
-    "Skeleton King": 4,
-    "Monk": 4,
-    "Little Prince": 3
-}
-# --------------------------------------------------
 
-# -------- NORMALIZATION (CRITICAL FIX) --------
-def normalize_name(name: str) -> str:
-    return (
-        name.lower()
-        .replace(".", "")
-        .replace("-", " ")
-        .replace(" ", "_")
-    )
-
-ELIXIR_COST = {
-    normalize_name(k): v for k, v in ELIXIR_COST_RAW.items()
-}
-# --------------------------------------------
-
-def get_elixir_regen_time(match_elapsed):
-    if match_elapsed >= 240:
-        return 0.9     # triple
-    elif match_elapsed >= 120:
-        return 1.4     # double
+def frame_source(args):
+    """Yields (bgr_frame, t_seconds, fps). Video uses frame_index/fps as the clock so
+    results do not depend on how fast your PC processes the clip."""
+    if args.video:
+        cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            sys.exit(f"Cannot open video: {args.video}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        i = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            yield frame, i / fps, fps
+            i += 1
+        cap.release()
     else:
-        return 2.8     # normal
+        import mss
+        top, left, width, height = (int(v) for v in args.region.split(","))
+        monitor = {"top": top, "left": left, "width": width, "height": height}
+        period = 1.0 / args.fps
+        with (mss.MSS() if hasattr(mss, "MSS") else mss.mss()) as sct:
+            next_tick = time.monotonic()
+            while True:
+                frame = np.ascontiguousarray(np.array(sct.grab(monitor))[:, :, :3])
+                yield frame, time.monotonic(), args.fps
+                next_tick += period                     # pace the loop to a steady frame rate
+                time.sleep(max(0.0, next_tick - time.monotonic()))
+
+
+def draw_overlay(frame, tracker, now, roi_px, recent, paused):
+    h, w = frame.shape[:2]
+    y0, y1 = roi_px
+    cv2.rectangle(frame, (0, y0), (w - 1, y1), (0, 200, 255), 1)       # enemy ROI
+    cv2.putText(frame, "enemy zone", (8, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
+
+    e = tracker.elixir
+    cv2.rectangle(frame, (20, 14), (20 + 330, 80), (0, 0, 0), -1)
+    cv2.putText(frame, f"Enemy Elixir: {e:4.1f}", (30, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 120, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(frame, (30, 54), (330, 68), (60, 60, 60), -1)         # elixir bar
+    cv2.rectangle(frame, (30, 54), (30 + int(300 * e / 10), 68), (255, 0, 200), -1)
+    clock = max(0.0, now - tracker.match_start)
+    cv2.putText(frame, f"{int(clock // 60)}:{int(clock % 60):02d}  {tracker.phase(now)}",
+                (w - 150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    for i, line in enumerate(reversed(recent)):                          # last plays, newest first
+        cv2.putText(frame, line, (30, 110 + 24 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+    if paused:
+        cv2.putText(frame, "waiting for battle start (--start-at)", (30, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+
 
 def run_demo():
-    sct = mss.mss()
+    args = parse_args()
+    if args.model:
+        os.environ["ELIXIR_MODEL"] = args.model
+    from card_classifier import deck_indices, predict_card   # imported late: torch is slow to load
+    allowed = deck_indices([c.strip() for c in args.deck.split(",")]) if args.deck else None
+    if args.save_crops:
+        os.makedirs(args.save_crops, exist_ok=True)
+    last_save_t = -1e9
+    saved = 0
+
+    roi_frac = tuple(float(v) for v in args.roi.split(","))
+    tracker = ElixirTracker(mirror=not args.no_mirror)
+    voter = CardVoter(window_sec=1.2, min_votes=3)
+
     prev_gray = None
-    recent_preds = deque(maxlen=DEBOUNCE_FRAMES)
+    recent = deque(maxlen=5)
+    last_play_t = -1e9
+    ignored_log = {}
+    started = args.video is None or args.start_at <= 0   # live: starts immediately (press 's' to re-sync)
+    first = True
 
-    # -------- Elixir state --------
-    enemy_elixir = START_ELIXIR
-    match_start_time = time.time()
-    last_elixir_update = match_start_time
-    last_elixir_print = match_start_time
+    if not args.headless:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    print("Running... press 'q' to quit, 's' = battle started, +/- = nudge elixir\n")
 
-    # -------- Detection state --------
-    last_detection_time = 0
-    last_played_card = None
+    try:
+        for frame, now, fps in frame_source(args):
+            h, w = frame.shape[:2]
+            if first:
+                tracker.reset(now if started else args.start_at)
+                first = False
+            if not started and now >= args.start_at:
+                tracker.reset(now)
+                started = True
 
-    cv2.namedWindow("Arena Elixir Tracker", cv2.WINDOW_NORMAL)
-    print("Running demo...")
-    print("Press 'q' to quit\n")
+            y0, y1 = int(h * roi_frac[0]), int(h * roi_frac[1])
+            scale = w / REF_WIDTH
+            min_area = MIN_CONTOUR_AREA * scale * scale
+            pad = max(4, int(PAD * scale))
 
-    while True:
-        frame = np.array(sct.grab(monitor))[:, :, :3]
-        frame = np.ascontiguousarray(frame)
-        now = time.time()
+            if started:
+                tracker.advance(now)
 
-        # -------- Elixir regeneration --------
-        match_elapsed = now - match_start_time
-        regen_time = get_elixir_regen_time(match_elapsed)
+                # ---- motion detection, restricted to the enemy half ----
+                gray = cv2.GaussianBlur(cv2.cvtColor(frame[y0:y1], cv2.COLOR_BGR2GRAY), (7, 7), 0)
+                if prev_gray is not None and prev_gray.shape == gray.shape:
+                    diff = cv2.absdiff(prev_gray, gray)
+                    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                    thresh = cv2.dilate(thresh, None, iterations=2)
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    roi_area = gray.shape[0] * gray.shape[1]
+                    contours = [c for c in contours
+                                if min_area < cv2.contourArea(c) < MAX_CONTOUR_FRACTION * roi_area]
 
-        if enemy_elixir < MAX_ELIXIR:
-            elapsed = now - last_elixir_update
-            gained = int(elapsed / regen_time)
-            if gained > 0:
-                enemy_elixir = min(MAX_ELIXIR, enemy_elixir + gained)
-                last_elixir_update += gained * regen_time
+                    if contours and (now - last_play_t) > POST_PLAY_COOLDOWN:
+                        c = max(contours, key=cv2.contourArea)
+                        x, y, bw, bh = cv2.boundingRect(c)
+                        y += y0                                         # ROI -> full-frame coords
+                        cx0, cy0 = max(0, x - pad), max(0, y - pad)     # pad on ALL sides, clamped
+                        cx1, cy1 = min(w, x + bw + pad), min(h, y + bh + pad)
+                        crop = frame[cy0:cy1, cx0:cx1]
+                        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
 
-        # -------- Print elixir every 2 sec --------
-        if now - last_elixir_print >= ELIXIR_PRINT_INTERVAL:
-            print(f"💧 Enemy elixir: {enemy_elixir}")
-            last_elixir_print = now
+                        if crop.size > 0:
+                            small = cv2.resize(crop, (128, 128))
+                            card, conf = predict_card(small, allowed)
+                            if args.save_crops and now - last_save_t > 0.4:       # <= 2.5 crops/s
+                                cv2.imwrite(os.path.join(args.save_crops, f"{saved:05d}_{card.replace(' ', '-')}_{conf:.2f}.png"), small)
+                                saved += 1
+                                last_save_t = now
+                            if card == "background":
+                                voter.clear()                                      # model says: not a card deployment
+                            elif conf > args.conf:
+                                confirmed = voter.add(card, now)
+                                if confirmed and lookup_cost(confirmed)[0] > tracker.elixir + ELIXIR_MARGIN:
+                                    # a card that costs more than the enemy's elixir can't have been played
+                                    if now - ignored_log.get(confirmed, -1e9) > 3.0:      # don't spam the log
+                                        print(f"[{now - tracker.match_start:6.1f}s] IGNORED {confirmed}: "
+                                              f"costs {lookup_cost(confirmed)[0]} but enemy has only {tracker.elixir:.1f}")
+                                        ignored_log[confirmed] = now
+                                    voter.clear()
+                                elif confirmed:
+                                    ev = tracker.play(confirmed, now)
+                                    voter.clear()
+                                    last_play_t = now
+                                    if ev:
+                                        tag = " (MIRRORED)" if ev.mirrored else ""
+                                        warn = "" if ev.known else "  [cost unknown, assumed]"
+                                        recent.append(f"{ev.card}{tag} -{ev.cost}")
+                                        print(f"[{ev.t:6.1f}s] CARD PLAYED: {ev.card}{tag}  cost {ev.cost}  "
+                                              f"elixir {ev.elixir_before:.1f} -> {ev.elixir_after:.1f}{warn}")
+                prev_gray = gray
 
-        # -------- Motion detection --------
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+            draw_overlay(frame, tracker, now, (y0, y1), recent, paused=not started)
 
-        if prev_gray is None:
-            prev_gray = gray
-            continue
 
-        diff = cv2.absdiff(prev_gray, gray)
-        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-        thresh = cv2.dilate(thresh, None, iterations=2)
+            if not args.headless:
+                cv2.imshow(WINDOW, frame)
+                k = cv2.waitKey(1) & 0xFF
+                if k == ord("q"):
+                    break
+                elif k == ord("s"):
+                    tracker.reset(now)
+                    started = True
+                    recent.clear()
+                    print("Battle clock re-synced, elixir = 5")
+                elif k in (ord("+"), ord("=")):
+                    tracker.adjust(+1, now)
+                elif k in (ord("-"), ord("_")):
+                    tracker.adjust(-1, now)
+    except KeyboardInterrupt:
+        print("\nInterrupted - saving what we have...")
 
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+    if not args.headless:
+        cv2.destroyAllWindows()
+    print(f"\nFinal enemy elixir estimate: {tracker.elixir:.1f}  ({len(tracker.history)} plays tracked)")
 
-        prev_gray = gray
-        contours = [c for c in contours if cv2.contourArea(c) > MIN_CONTOUR_AREA]
-
-        # -------- Card detection --------
-        if contours and (now - last_detection_time) > DETECTION_COOLDOWN:
-            c = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(c)
-
-            pad = 20
-            x = max(0, x - pad)
-            y = max(0, y - pad)
-            crop = frame[y:y+h+pad, x:x+w+pad]
-
-            if crop.size > 0:
-                crop = cv2.resize(crop, (128, 128))
-                card, conf = predict_card(crop)
-
-                if conf > CONF_THRESHOLD:
-                    recent_preds.append(card)
-
-                    if recent_preds.count(card) >= DEBOUNCE_FRAMES:
-                        base_cost = ELIXIR_COST.get(card, 0)
-
-                        if base_cost == 0:
-                            print(f"⚠️ No elixir cost found for '{card}'")
-
-                        # -------- Mirror logic --------
-                        if last_played_card == card:
-                            cost = base_cost + 1
-                            mirror = " (MIRRORED)"
-                        else:
-                            cost = base_cost
-                            mirror = ""
-
-                        enemy_elixir = max(0, enemy_elixir - cost)
-                        last_played_card = card
-                        last_detection_time = now
-                        recent_preds.clear()
-
-                        print(f"\n🎯 CARD PLAYED: {card}{mirror}")
-                        print(f"💧 Elixir used: {cost}")
-                        print(f"💧 Enemy elixir now: {enemy_elixir}\n")
-
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-
-        cv2.putText(
-            frame,
-            f"Enemy Elixir: {enemy_elixir}",
-            (30, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.1,
-            (255, 0, 0),
-            3,
-            cv2.LINE_AA
-        )
-
-        cv2.imshow("Arena Elixir Tracker", frame)
-
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            print("Exiting demo.")
-            break
-
-    cv2.destroyAllWindows()
-    sct.close()
 
 if __name__ == "__main__":
     run_demo()

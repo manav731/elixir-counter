@@ -1,0 +1,8 @@
+torch
+torchvision
+opencv-python
+numpy
+mss
+pillow
+tqdm
+pyautogui
