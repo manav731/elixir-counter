@@ -16,5 +16,5 @@ print(f"Bottom-right recorded at: ({x2}, {y2})")
 width = x2 - x1
 height = y2 - y1
 
-print("\nUse this monitor region in screen_capture.py:")
-print(f'{{"top": {y1}, "left": {x1}, "width": {width}, "height": {height}}}')
+print("\nRun the tracker with this region:")
+print(f"python src/motion_detect_demo.py --region {y1},{x1},{width},{height}")

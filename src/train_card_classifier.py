@@ -6,12 +6,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ================= CONFIG =================
-DATA_DIR = r"C:\ElixerTracker\data\icons\dataset"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.environ.get("ELIXIR_DATA", os.path.join(ROOT, "data", "icons", "dataset"))
 IMG_SIZE = 128
 BATCH_SIZE = 8
 EPOCHS = 25
 LEARNING_RATE = 1e-3
-MODEL_OUT = r"C:\ElixerTracker\models\card_classifier.pth"
+MODEL_OUT = os.environ.get("ELIXIR_MODEL", os.path.join(ROOT, "models", "card_classifier.pth"))
 # ==========================================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -74,6 +75,9 @@ os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
 
 for epoch in range(EPOCHS):
     model.train()
+    # Backbone is frozen, so keep its BatchNorm layers in eval mode too; otherwise their
+    # running stats keep drifting on tiny batches and no longer match what inference uses.
+    model.features.eval()
     epoch_loss = 0.0
 
     for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
@@ -109,6 +113,20 @@ for epoch in range(EPOCHS):
             "classes": train_ds.classes
         }, MODEL_OUT)
         print("✅ Best model saved")
+
+# --------- Final held-out test accuracy (the original never used the test split) ---------
+test_dir = os.path.join(DATA_DIR, "test")
+if os.path.isdir(test_dir):
+    best = torch.load(MODEL_OUT, map_location=device)
+    model.load_state_dict(best["model_state"])
+    model.eval()
+    test_ds = datasets.ImageFolder(test_dir, transform=val_tfms)
+    ok = n = 0
+    with torch.no_grad():
+        for x, y in DataLoader(test_ds, batch_size=BATCH_SIZE):
+            ok += (model(x.to(device)).argmax(1).cpu() == y).sum().item()
+            n += y.size(0)
+    print(f"Test accuracy: {ok / max(n, 1):.3f} ({ok}/{n})")
 
 print("\nTraining finished.")
 print("Best validation accuracy:", best_val_acc)
